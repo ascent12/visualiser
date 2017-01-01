@@ -1,9 +1,11 @@
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <tgmath.h>
 #include <time.h>
+#include <sched.h>
 
 #include <alsa/asoundlib.h>
 
@@ -12,6 +14,8 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
+// Global variables wrapped up in a struct for neatness.
+// TODO: Get rid of all of these
 struct {
 	GLFWwindow *win;
 
@@ -27,9 +31,15 @@ struct {
 
 	snd_pcm_t *pcm_handle;
 
-	_Bool linear;
+	bool linear;
 	float scale;
-} glob = { .scale = 25.0f };
+	unsigned fft_size;
+	bool fft_recalculate;
+} glob = {
+	// Default values
+	.scale = 15.0f,
+	.fft_size = 0x1000,
+};
 
 static void error_callback(int error, const char *desc)
 {
@@ -52,10 +62,22 @@ static void key_callback(GLFWwindow *win, int key, int scancode, int action, int
 			glob.linear = !glob.linear;
 			break;
 		case GLFW_KEY_UP:
-			glob.scale += 5.0f;
+			glob.scale *= 1.2f;
 			break;
 		case GLFW_KEY_DOWN:
-			glob.scale -= 5.0f;
+			glob.scale *= 0.8f;
+			break;
+		case GLFW_KEY_LEFT:
+			if (glob.fft_size != 0x80000000) {
+				glob.fft_size <<= 1;
+				glob.fft_recalculate = true;
+			}
+			break;
+		case GLFW_KEY_RIGHT:
+			if (glob.fft_size != 0x00000001) {
+				glob.fft_size >>= 1;
+				glob.fft_recalculate = true;
+			}
 			break;
 		default:
 			break;
@@ -86,7 +108,6 @@ static void init_window()
 
 	glewExperimental = GL_TRUE;
 	glewInit();
-	//(void)glGetError(); // Throw out possible GL_INVALID_ENUM
 }
 
 static void destroy_window()
@@ -271,50 +292,6 @@ struct wave *read_wave(const char *filename)
 	return wav;
 }
 
-#define N 0x1000
-
-#define FRAME_SIZE (N / 4)
-#define AUDIO_SIZE 500
-#define AUDIO_FRAME (FRAME_SIZE * AUDIO_SIZE)
-
-volatile sig_atomic_t should_run = 0;
-
-void handler(int num)
-{
-	(void)num;
-	should_run = 1;
-}
-
-void init_timer(uint32_t sample_rate)
-{
-	struct sigaction sa = {
-		.sa_handler = handler,
-	};
-
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-
-	sigaction(SIGUSR1, &sa, NULL);
-
-	timer_t timer;
-	struct sigevent se = {
-		.sigev_notify = SIGEV_SIGNAL,
-		.sigev_signo = SIGUSR1,
-	};
-
-	timer_create(CLOCK_MONOTONIC, &se, &timer);
-
-	struct itimerspec spec = {
-		.it_interval = {
-			.tv_sec = 0,
-			.tv_nsec = (1.0f / sample_rate) * FRAME_SIZE * 1000000000,
-		},
-		.it_value = spec.it_interval,
-	};
-
-	timer_settime(timer, 0, &spec, NULL);
-}
-
 void init_alsa(struct wave *wav)
 {
 	int ret;
@@ -364,7 +341,10 @@ void init_alsa(struct wave *wav)
 void destroy_alsa()
 {
 	snd_pcm_close(glob.pcm_handle);
+	snd_config_update_free_global();
 }
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 int main(int argc, char *argv[])
 {
@@ -375,81 +355,135 @@ int main(int argc, char *argv[])
 
 	struct wave *wav = read_wave(argv[1]);
 
-	float *real = fftwf_alloc_real(N);
-	complex float *cmplx = fftwf_alloc_complex(N);
+	// I'm going to make these modifiable at runtime at some point,
+	// but until then, they can just be const
 
-	fftwf_plan plan = fftwf_plan_dft_r2c_1d(N, real, cmplx, FFTW_MEASURE);
+	const unsigned frames_per_sec = 60;
+	const size_t frame_offset = wav->fmt.sample_rate / frames_per_sec;
+	const size_t audio_offset = frame_offset * 32;
 
-	size_t data_len = wav->data_hdr.size / wav->fmt.channels;
-	static GLfloat arr[N / 2 + 1][2] = { [N / 2] = {1.0f, 0.0f} };
+	size_t num_samples = wav->data_hdr.size / wav->fmt.channels / sizeof(int16_t);
 
 	init_window();
 	init_opengl();
 	init_alsa(wav);
-	init_timer(wav->fmt.sample_rate);
 
-	int should_write = 0;
-	int16_t (*prev_audio)[2] = &wav->data[0];
+	struct timespec time_now, time_next;
+	clock_gettime(CLOCK_MONOTONIC, &time_now);
+	time_next = time_now;
 
-	snd_pcm_writei(glob.pcm_handle, prev_audio, AUDIO_FRAME);
-	prev_audio += AUDIO_FRAME;
+	// FFT related variables.
+	// These should be initalised properly the first time we run the loop
 
-	float log_scale = 2.0f / log10(N / 2.0f);
+	fftwf_plan plan = NULL;
+	float *real = NULL;
+	complex float *cmplx = NULL;
+	GLfloat (*arr)[2] = NULL;
+	float log_scale = 0.0f;
 
-	for (size_t i = 0; i < data_len && !glfwWindowShouldClose(glob.win); i += FRAME_SIZE) {
-	//while (!glfwWindowShouldClose(glob.win) && data < wav->data + data_len - N) {
+	snd_pcm_writei(glob.pcm_handle, &wav->data[0][0], audio_offset);
+	snd_pcm_pause(glob.pcm_handle, 1);
+
+	glob.fft_recalculate = true;
+
+	for (size_t i = 0; i < num_samples && !glfwWindowShouldClose(glob.win); i += frame_offset) {
+		if (glob.fft_recalculate) {
+			// Pause the audio, because computing a new FFT is expensive
+			// and can desync the audio
+			snd_pcm_pause(glob.pcm_handle, 1);
+
+			// fftw doesn't seem to have a realloc() function
+			fftwf_free(real);
+			fftwf_free(cmplx);
+
+			real = fftwf_alloc_real(glob.fft_size);
+			cmplx = fftwf_alloc_complex(glob.fft_size);
+
+			fftwf_destroy_plan(plan);
+			plan = fftwf_plan_dft_r2c_1d(glob.fft_size, real, cmplx, FFTW_MEASURE);
+
+			arr = realloc(arr, sizeof *arr * ((glob.fft_size / 2) + 1));
+			arr[glob.fft_size / 2][0] = 1.0f;
+			arr[glob.fft_size / 2][1] = 0.0f;
+
+			log_scale = 2.0f / log10(glob.fft_size / 2.0f);
+
+			glob.fft_recalculate = false;
+			snd_pcm_pause(glob.pcm_handle, 0);
+		}
+
 		float avg = 0.0f;
-		for (size_t j = 0; j < N; ++j) {
+		for (size_t j = 0; j < min(glob.fft_size, num_samples - i - 1); ++j) {
 			int16_t mono = (wav->data[i + j][0] + wav->data[i + j][1]) / 2;
 			float sample = (float)mono / INT16_MAX;
 
 			real[j] = sample;
-			avg += sample / N;
+			avg += sample / glob.fft_size;
 		}
 
-		for (size_t j = 0; j < N; ++j)
+		for (size_t j = num_samples - i - 1; j < glob.fft_size; ++j)
+			real[j] = 0.0f;
+
+		for (size_t j = 0; j < glob.fft_size; ++j)
 			real[j] -= avg;
 
 		fftwf_execute(plan);
 
-		for (size_t j = 0; j < N / 2; ++j) {
+		for (size_t j = 0; j < glob.fft_size / 2; ++j) {
 			if (glob.linear)
-				arr[j][0] = 2.0f / (N / 2) * j - 1.0f;
+				arr[j][0] = 2.0f / (glob.fft_size / 2) * j - 1.0f;
 			else
 				arr[j][0] = log10((float)j) * log_scale - 1.0f;
 
-			arr[j][1] = fabs(cmplx[j] / N) * glob.scale - 1.0f;
+			arr[j][1] = fabs(cmplx[j] / glob.fft_size) * glob.scale - 1.0f;
 		}
 
-		if (should_write == 0) {
-			printf("write\n");
-			int nwrite;
-			if (prev_audio + AUDIO_FRAME > wav->data + data_len)
-				nwrite = wav->data - prev_audio;
-			else
-				nwrite = AUDIO_FRAME;
+		if (i % audio_offset == 0) {
+			// We always start 1 frame ahead, so the buffer never fully drains
+			size_t frame_start = i + audio_offset;
 
-			int ret = snd_pcm_writei(glob.pcm_handle, &prev_audio[0], nwrite);
-			if (ret < 0) {
-				fprintf(stderr, "snd_pcm_writei: %s\n", snd_strerror(ret));
-				snd_pcm_recover(glob.pcm_handle, ret, 0);
+			if (frame_start < num_samples) {
+				int ret = snd_pcm_writei(glob.pcm_handle,
+							 &wav->data[frame_start][0],
+							 min(audio_offset, num_samples - frame_start));
+				if (ret < 0) {
+					fprintf(stderr, "snd_pcm_writei: %s\n", snd_strerror(ret));
+					snd_pcm_recover(glob.pcm_handle, ret, 0);
+				}
 			}
-
-			prev_audio += nwrite;
 		}
 
-		should_write = (should_write + 1) % AUDIO_SIZE;
+		render(arr, sizeof *arr * (glob.fft_size / 2) + 1, glob.fft_size / 2);
 
-		while (!should_run);
-		should_run = 0;
+		// Wait to start the next frame
+		do {
+			sched_yield();
+			clock_gettime(CLOCK_MONOTONIC, &time_now);
+		} while (time_next.tv_sec > time_now.tv_sec && time_next.tv_nsec > time_now.tv_nsec);
 
-		render(arr, sizeof arr, N / 2);
+		time_next.tv_nsec += (1e9 / wav->fmt.sample_rate) * frame_offset;
+		if (time_next.tv_nsec > 1e9) {
+			time_next.tv_nsec -= 1e9;
+			++time_next.tv_sec;
+		};
+
 		glfwPollEvents();
 	}
+
+	if (glfwWindowShouldClose(glob.win))
+		snd_pcm_drop(glob.pcm_handle);
+	else
+		snd_pcm_drain(glob.pcm_handle);
 
 	destroy_alsa();
 	destroy_opengl();
 	destroy_window();
 
+	fftwf_free(real);
+	fftwf_free(cmplx);
+	fftwf_destroy_plan(plan);
+	fftwf_cleanup();
+
+	free(arr);
 	free(wav);
 }

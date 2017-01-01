@@ -1,0 +1,45 @@
+A visualiser for audio using OpenGL.
+
+![screenshot](https://raw.githubusercontent.com/ascent12/visualiser/master/screenshot.png)
+
+Note: this is not high-quality code intended for other people to use.
+It was mainly written as a learning experience for audio programming and OpenGL.
+I might improve it in the future, but for the time being, it remains as a hack-job.
+
+# Dependencies:
+- GLFW
+- FFTW
+- ALSA
+
+# Usage:
+Compile with
+```sh
+make
+```
+
+Run with
+```sh
+./main some_file.wav
+```
+
+The way this programs reads WAV files is very crappy, and it expects a very specific format of WAV files with absolutely no metadata.  
+Using FFMPEG, we can convert a file into the format this program expects:
+```sh
+ffmpeg -i input_file.flac -sample_fmt s16 -ar 44100 -map_metadata -1 -fflags +bitexact output_file.wav
+```
+Different sample rates will work, but results may be unexpected.  
+I'll hopefully read WAV files properly at some point.  
+
+# Controls:
+- `ESC`: Quit
+- `Up`: Scale +10%
+- `Down`: Scale -10%
+- `Left`: Double FFT size
+- `Right`: Half FFT size
+- `L`: Switch between Logarithmic/Linear views (Default: Logarithmic)
+
+# FFT size:
+The FFT size has a direct impact on the horizontal resolution of the output, and how long a signal will stay on the display.  
+Setting the FFT size to be too large will have strange results, where the audio signals stay on the screen for far too long.  
+Setting the FFT too low will also have strange results, with the audio signals appearing 'jittery'.  
+Staying reasonably close to the default value has the best results.  
