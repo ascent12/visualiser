@@ -157,6 +157,8 @@ static GLuint create_shader(GLenum type, const GLchar *src)
 	return shader;
 }
 
+// Linear scaling
+/*
 static const GLchar vertex_shader[] =
 "#version 330 core\n"
 "uniform int max;\n"
@@ -165,6 +167,20 @@ static const GLchar vertex_shader[] =
 "void main() {\n"
 "	width = 4.0 / max;\n"
 "	gl_Position = vec4(width * gl_VertexID - 1.0, pos, 0.0, 1.0);\n"
+"}\n";
+*/
+
+// Logarithmic scaling
+static const GLchar vertex_shader[] =
+"#version 330 core\n"
+"uniform float scale;\n"
+"layout(location = 0) in float pos;\n"
+"out float width;\n"
+"void main() {\n"
+"	int i = (gl_VertexID == 0) ? 1 : gl_VertexID;\n"
+"	float x = log(i) * scale;\n"
+"	width = log(i + 1) * scale - x;\n"
+"	gl_Position = vec4(x - 1.0, pos, 0.0, 1.0);\n"
 "}\n";
 
 static const GLchar fragment_shader[] =
@@ -251,8 +267,13 @@ void render(GLfloat arr[], GLsizeiptr arr_size, GLsizei count)
 	glfwGetFramebufferSize(glob.win, &width, &height);
 	glViewport(0, 0, width, height);
 
-	GLint max = glGetUniformLocation(glob.gl_prog.prog, "max");
-	glUniform1i(max, count);
+	// Linear
+	//GLint max = glGetUniformLocation(glob.gl_prog.prog, "max");
+	//glUniform1i(max, count);
+
+	// Logarithmic
+	GLint scale = glGetUniformLocation(glob.gl_prog.prog, "scale");
+	glUniform1f(scale, 2.0 / log(count));
 
 	glBufferData(GL_ARRAY_BUFFER, arr_size, arr, GL_STATIC_DRAW);
 
@@ -395,7 +416,6 @@ int main(int argc, char *argv[])
 	float *real = NULL;
 	complex float *cmplx = NULL;
 	GLfloat *arr = NULL;
-	float log_scale = 0.0f;
 
 	snd_pcm_writei(glob.pcm_handle, &wav->data[0][0], audio_offset);
 	snd_pcm_pause(glob.pcm_handle, 1);
@@ -419,8 +439,6 @@ int main(int argc, char *argv[])
 			plan = fftwf_plan_dft_r2c_1d(glob.fft_size, real, cmplx, FFTW_MEASURE);
 
 			arr = realloc(arr, sizeof *arr * (glob.fft_size / 2));
-
-			log_scale = 2.0f / log10(glob.fft_size / 2.0f);
 
 			glob.fft_recalculate = false;
 			snd_pcm_pause(glob.pcm_handle, 0);
