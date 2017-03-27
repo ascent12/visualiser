@@ -159,12 +159,12 @@ static GLuint create_shader(GLenum type, const GLchar *src)
 
 static const GLchar vertex_shader[] =
 "#version 330 core\n"
-"layout(location = 0) in vec2 pos;\n"
-"layout(location = 2) in float next_x;\n"
-"out float v_next_x;\n"
+"uniform int max;\n"
+"layout(location = 0) in float pos;\n"
+"out float width;\n"
 "void main() {\n"
-"	v_next_x = next_x;\n"
-"	gl_Position = vec4(pos, 0.0, 1.0);\n"
+"	width = 4.0 / max;\n"
+"	gl_Position = vec4(width * gl_VertexID - 1.0, pos, 0.0, 1.0);\n"
 "}\n";
 
 static const GLchar fragment_shader[] =
@@ -178,20 +178,20 @@ static const GLchar geometry_shader[] =
 "#version 330 core\n"
 "layout(points) in;\n"
 "layout(triangle_strip, max_vertices = 4) out;\n"
-"in float v_next_x[];\n"
+"in float width[];\n"
 "void main() {\n"
 "	vec4 v = gl_in[0].gl_Position;\n"
 
 "	gl_Position = v;\n"
 "	EmitVertex();\n"
 
-"	gl_Position = vec4(v_next_x[0], v.yzw);\n"
+"	gl_Position = vec4(v.x + width[0], v.yzw);\n"
 "	EmitVertex();\n"
 
 "	gl_Position = vec4(v.x, -1.0, v.zw);\n"
 "	EmitVertex();\n"
 
-"	gl_Position = vec4(v_next_x[0], -1.0, v.zw);\n"
+"	gl_Position = vec4(v.x + width[0], -1.0, v.zw);\n"
 "	EmitVertex();\n"
 
 "	EndPrimitive();\n"
@@ -234,9 +234,7 @@ static void init_opengl()
 	glBindBuffer(GL_ARRAY_BUFFER, glob.vbo);
 
 	glEnableVertexAttribArray(0);
-	glEnableVertexAttribArray(2);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 2, NULL);
-	glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 2, (void *)(sizeof(GLfloat) * 2));
+	glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, sizeof(GLfloat), NULL);
 }
 
 static void destroy_opengl()
@@ -247,11 +245,14 @@ static void destroy_opengl()
 	glDeleteProgram(glob.gl_prog.prog);
 }
 
-void render(GLfloat arr[][2], GLsizeiptr arr_size, GLsizei count)
+void render(GLfloat arr[], GLsizeiptr arr_size, GLsizei count)
 {
 	int width, height;
 	glfwGetFramebufferSize(glob.win, &width, &height);
 	glViewport(0, 0, width, height);
+
+	GLint max = glGetUniformLocation(glob.gl_prog.prog, "max");
+	glUniform1i(max, count);
 
 	glBufferData(GL_ARRAY_BUFFER, arr_size, arr, GL_STATIC_DRAW);
 
@@ -393,7 +394,7 @@ int main(int argc, char *argv[])
 	fftwf_plan plan = NULL;
 	float *real = NULL;
 	complex float *cmplx = NULL;
-	GLfloat (*arr)[2] = NULL;
+	GLfloat *arr = NULL;
 	float log_scale = 0.0f;
 
 	snd_pcm_writei(glob.pcm_handle, &wav->data[0][0], audio_offset);
@@ -417,9 +418,7 @@ int main(int argc, char *argv[])
 			fftwf_destroy_plan(plan);
 			plan = fftwf_plan_dft_r2c_1d(glob.fft_size, real, cmplx, FFTW_MEASURE);
 
-			arr = realloc(arr, sizeof *arr * ((glob.fft_size / 2) + 1));
-			arr[glob.fft_size / 2][0] = 1.0f;
-			arr[glob.fft_size / 2][1] = 0.0f;
+			arr = realloc(arr, sizeof *arr * (glob.fft_size / 2));
 
 			log_scale = 2.0f / log10(glob.fft_size / 2.0f);
 
@@ -445,12 +444,7 @@ int main(int argc, char *argv[])
 		fftwf_execute(plan);
 
 		for (size_t j = 0; j < glob.fft_size / 2; ++j) {
-			if (glob.linear)
-				arr[j][0] = 2.0f / (glob.fft_size / 2) * j - 1.0f;
-			else
-				arr[j][0] = log10((float)j) * log_scale - 1.0f;
-
-			arr[j][1] = fabs(cmplx[j] / glob.fft_size) * glob.scale - 1.0f;
+			arr[j] = fabs(cmplx[j] / glob.fft_size) * glob.scale - 1.0f;
 		}
 
 		if (i % audio_offset == 0) {
@@ -468,7 +462,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		render(arr, sizeof *arr * (glob.fft_size / 2) + 1, glob.fft_size / 2);
+		render(arr, sizeof *arr * (glob.fft_size / 2), glob.fft_size / 2);
 
 		// Wait to start the next frame
 		do {
