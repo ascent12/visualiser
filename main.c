@@ -29,29 +29,22 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
+#include "gl.h"
+
 // Global variables wrapped up in a struct for neatness.
 // TODO: Get rid of all of these
 struct {
 	GLFWwindow *win;
 
-	struct {
-		GLuint prog;
-		GLuint vert;
-		GLuint frag;
-		GLuint geom;
-	} gl_prog;
-
-	GLuint vao;
-	GLuint vbo;
-
 	snd_pcm_t *pcm_handle;
 
-	bool linear;
+	enum scale horiz_scale;
 	float scale;
 	unsigned fft_size;
 	bool fft_recalculate;
 } glob = {
 	// Default values
+	.horiz_scale = SCALE_LOG,
 	.scale = 15.0f,
 	.fft_size = 0x1000,
 };
@@ -74,7 +67,7 @@ static void key_callback(GLFWwindow *win, int key, int scancode, int action, int
 			glfwSetWindowShouldClose(win, GL_TRUE);
 			break;
 		case GLFW_KEY_L:
-			glob.linear = !glob.linear;
+			glob.horiz_scale = (glob.horiz_scale + 1) % SCALE_MAX;
 			break;
 		case GLFW_KEY_UP:
 			glob.scale *= 1.2f;
@@ -129,164 +122,6 @@ static void destroy_window()
 {
 	glfwDestroyWindow(glob.win);
 	glfwTerminate();
-}
-
-static GLuint create_shader(GLenum type, const GLchar *src)
-{
-	GLuint shader = glCreateShader(type);
-	glShaderSource(shader, 1, &src, NULL);
-	glCompileShader(shader);
-
-	GLint ret;
-	glGetShaderiv(shader, GL_COMPILE_STATUS, &ret);
-
-	if (ret == GL_FALSE) {
-		GLint loglen;
-		glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &loglen);
-
-		if (loglen != 0) {
-			GLchar msg[loglen];
-			glGetShaderInfoLog(shader, loglen, &loglen, msg);
-
-			puts(msg);
-		}
-
-		exit(EXIT_FAILURE);
-	}
-
-	return shader;
-}
-
-// Linear scaling
-/*
-static const GLchar vertex_shader[] =
-"#version 330 core\n"
-"uniform int max;\n"
-"layout(location = 0) in float pos;\n"
-"out float width;\n"
-"void main() {\n"
-"	width = 4.0 / max;\n"
-"	gl_Position = vec4(width * gl_VertexID - 1.0, pos, 0.0, 1.0);\n"
-"}\n";
-*/
-
-// Logarithmic scaling
-static const GLchar vertex_shader[] =
-"#version 330 core\n"
-"uniform float scale;\n"
-"layout(location = 0) in float pos;\n"
-"out float width;\n"
-"void main() {\n"
-"	int i = (gl_VertexID == 0) ? 1 : gl_VertexID;\n"
-"	float x = log(i) * scale;\n"
-"	width = log(i + 1) * scale - x;\n"
-"	gl_Position = vec4(x - 1.0, pos, 0.0, 1.0);\n"
-"}\n";
-
-static const GLchar fragment_shader[] =
-"#version 330 core\n"
-"out vec4 color;\n"
-"void main() {\n"
-"	color = vec4(1.0, 0.0, 0.0, 1.0);\n"
-"}\n";
-
-static const GLchar geometry_shader[] =
-"#version 330 core\n"
-"layout(points) in;\n"
-"layout(triangle_strip, max_vertices = 4) out;\n"
-"in float width[];\n"
-"void main() {\n"
-"	vec4 v = gl_in[0].gl_Position;\n"
-
-"	gl_Position = v;\n"
-"	EmitVertex();\n"
-
-"	gl_Position = vec4(v.x + width[0], v.yzw);\n"
-"	EmitVertex();\n"
-
-"	gl_Position = vec4(v.x, -1.0, v.zw);\n"
-"	EmitVertex();\n"
-
-"	gl_Position = vec4(v.x + width[0], -1.0, v.zw);\n"
-"	EmitVertex();\n"
-
-"	EndPrimitive();\n"
-"}";
-
-static void init_opengl()
-{
-	glob.gl_prog.vert = create_shader(GL_VERTEX_SHADER, vertex_shader);
-	glob.gl_prog.frag = create_shader(GL_FRAGMENT_SHADER, fragment_shader);
-	glob.gl_prog.geom = create_shader(GL_GEOMETRY_SHADER, geometry_shader);
-
-	glob.gl_prog.prog = glCreateProgram();
-	glAttachShader(glob.gl_prog.prog, glob.gl_prog.vert);
-	glAttachShader(glob.gl_prog.prog, glob.gl_prog.geom);
-	glAttachShader(glob.gl_prog.prog, glob.gl_prog.frag);
-	glLinkProgram(glob.gl_prog.prog);
-
-	GLint ret;
-	glGetProgramiv(glob.gl_prog.prog, GL_LINK_STATUS, &ret);
-
-	if (ret == GL_FALSE) {
-		GLint loglen;
-		glGetProgramiv(glob.gl_prog.prog, GL_INFO_LOG_LENGTH, &loglen);
-
-		if (loglen != 0) {
-			GLchar msg[loglen];
-			glGetProgramInfoLog(glob.gl_prog.prog, loglen, &loglen, msg);
-
-			puts(msg);
-		}
-
-		exit(EXIT_FAILURE);
-	}
-
-	glGenVertexArrays(1, &glob.vao);
-	glGenBuffers(1, &glob.vbo);
-
-	glUseProgram(glob.gl_prog.prog);
-	glBindVertexArray(glob.vao);
-	glBindBuffer(GL_ARRAY_BUFFER, glob.vbo);
-
-	glEnableVertexAttribArray(0);
-	glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, sizeof(GLfloat), NULL);
-}
-
-static void destroy_opengl()
-{
-	glDeleteProgram(glob.gl_prog.vert);
-	glDeleteProgram(glob.gl_prog.frag);
-	glDeleteProgram(glob.gl_prog.geom);
-	glDeleteProgram(glob.gl_prog.prog);
-}
-
-void render(GLfloat arr[], GLsizeiptr arr_size, GLsizei count)
-{
-	int width, height;
-	glfwGetFramebufferSize(glob.win, &width, &height);
-	glViewport(0, 0, width, height);
-
-	// Linear
-	//GLint max = glGetUniformLocation(glob.gl_prog.prog, "max");
-	//glUniform1i(max, count);
-
-	// Logarithmic
-	GLint scale = glGetUniformLocation(glob.gl_prog.prog, "scale");
-	glUniform1f(scale, 2.0 / log(count));
-
-	glBufferData(GL_ARRAY_BUFFER, arr_size, arr, GL_STATIC_DRAW);
-
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glBindVertexArray(glob.vao);
-	glUseProgram(glob.gl_prog.prog);
-
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
-
-	glDrawArrays(GL_POINTS, 0, count);
-
-	glfwSwapBuffers(glob.win);
 }
 
 struct wave {
@@ -402,7 +237,7 @@ int main(int argc, char *argv[])
 	size_t num_samples = wav->data_hdr.size / wav->fmt.channels / sizeof(int16_t);
 
 	init_window();
-	init_opengl();
+	gl_init();
 	init_alsa(wav);
 
 	struct timespec time_now, time_next;
@@ -480,7 +315,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		render(arr, sizeof *arr * (glob.fft_size / 2), glob.fft_size / 2);
+		gl_render(glob.win, glob.fft_size / 2, arr, glob.horiz_scale);
 
 		// Wait to start the next frame
 		do {
@@ -503,7 +338,7 @@ int main(int argc, char *argv[])
 		snd_pcm_drain(glob.pcm_handle);
 
 	destroy_alsa();
-	destroy_opengl();
+	gl_destroy();
 	destroy_window();
 
 	fftwf_free(real);
