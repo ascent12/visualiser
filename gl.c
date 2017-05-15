@@ -174,9 +174,11 @@ void gl_render(GLFWwindow *win, size_t n, float arr[static restrict n], enum sca
 
 	switch (s) {
 	case SCALE_LIN:
+		// in_width
 		glUniform1f(0, 4.0 / n);
 		break;
 	case SCALE_LOG:
+		// scale
 		glUniform1f(0, 2.0 / log(n));
 		break;
 	default:

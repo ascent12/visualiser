@@ -22,14 +22,6 @@ Run with
 ./main some_file.wav
 ```
 
-The way this programs reads WAV files is very crappy, and it expects a very specific format of WAV files with absolutely no metadata.  
-Using FFMPEG, we can convert a file into the format this program expects:
-```sh
-ffmpeg -i input_file.flac -sample_fmt s16 -ar 44100 -map_metadata -1 -fflags +bitexact output_file.wav
-```
-Different sample rates will work, but results may be unexpected.  
-I'll hopefully read WAV files properly at some point.  
-
 # Controls:
 - `ESC`: Quit
 - `Up`: Scale +10%

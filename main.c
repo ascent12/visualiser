@@ -21,13 +21,16 @@
 #include <tgmath.h>
 #include <time.h>
 #include <sched.h>
+#include <stdint.h>
 
 #include <alsa/asoundlib.h>
 
 #include <fftw3.h>
 
-#include <GL/glew.h>
-#include <GLFW/glfw3.h>
+#include <libavutil/opt.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
 
 #include "gl.h"
 
@@ -124,47 +127,17 @@ static void destroy_window()
 	glfwTerminate();
 }
 
-struct wave {
-	struct {
-		uint8_t id[4];
-		uint32_t size;
-		uint8_t format;
-	} riff;
-	struct chunk {
-		uint8_t id[4];
-		uint32_t size;
-	} fmt_hdr;
-	struct {
-		uint16_t format;
-		uint16_t channels;
-		uint32_t sample_rate;
-		uint32_t byte_rate;
-		uint16_t block_align;
-		uint16_t bit_depth;
-	} fmt;
-	struct chunk data_hdr;
-	int16_t data[][2];
+struct audio_info {
+	int sample_rate;
+	int channels;
+
+	size_t num_samples;
+
+	int16_t (*playback)[2];
+	float *data;
 };
 
-struct wave *read_wave(const char *filename)
-{
-	FILE *fp = fopen(filename, "rb");
-	if (!fp) {
-		perror("");
-		exit(EXIT_FAILURE);
-	}
-
-	uint32_t buf[2];
-	fread(buf, sizeof buf[0], 2, fp);
-	fseek(fp, 0, SEEK_SET);
-
-	struct wave *wav = malloc(buf[1] + 8);
-	fread(wav, buf[1] + 8, 1, fp);
-
-	return wav;
-}
-
-void init_alsa(struct wave *wav)
+void init_alsa(struct audio_info *info)
 {
 	int ret;
 
@@ -190,13 +163,13 @@ void init_alsa(struct wave *wav)
 		exit(EXIT_FAILURE);
 	}
 
-	ret = snd_pcm_hw_params_set_channels(glob.pcm_handle, params, wav->fmt.channels);
+	ret = snd_pcm_hw_params_set_channels(glob.pcm_handle, params, info->channels);
 	if (ret < 0) {
 		fprintf(stderr, "snd_pcm_hw_params_set_channels: %s\n", snd_strerror(ret));
 		exit(EXIT_FAILURE);
 	}
 
-	unsigned rate = wav->fmt.sample_rate;
+	unsigned rate = info->sample_rate;
 	ret = snd_pcm_hw_params_set_rate_near(glob.pcm_handle, params, &rate, 0);
 	if (ret < 0) {
 		fprintf(stderr, "snd_pcm_hw_params_set_rate_near: %s\n", snd_strerror(ret));
@@ -216,6 +189,152 @@ void destroy_alsa()
 	snd_config_update_free_global();
 }
 
+void free_audio_file(struct audio_info *info)
+{
+	free(info->playback);
+	free(info->data);
+}
+
+void get_audio_file(const char *path, int sample_rate, struct audio_info *info)
+{
+	av_register_all();
+
+	AVFormatContext *format = NULL;
+	if (avformat_open_input(&format, path, NULL, NULL) != 0) {
+		fprintf(stderr, "Could not open %s\n", path);
+		exit(EXIT_FAILURE);
+	}
+
+	if (avformat_find_stream_info(format, NULL) < 0) {
+		fprintf(stderr, "Could not retrieve stream info for %s\n", path);
+		exit(EXIT_FAILURE);
+	}
+
+	int stream_index = -1;
+	for (unsigned i = 0; i < format->nb_streams; ++i) {
+		if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+			stream_index = i;
+			break;
+		}
+	}
+
+	if (stream_index == -1) {
+		fprintf(stderr, "Could not retrieve audio stream from %s\n", path);
+		exit(EXIT_FAILURE);
+	}
+
+	AVStream *stream = format->streams[stream_index];
+
+	AVCodecParameters *codec = stream->codecpar;
+	AVCodecContext *cntxt = avcodec_alloc_context3(NULL);
+
+	if (avcodec_parameters_to_context(cntxt, codec) < 0) {
+		fprintf(stderr, "Unable to converts pamaters to context\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (avcodec_open2(cntxt, avcodec_find_decoder(codec->codec_id), NULL) < 0) {
+		fprintf(stderr, "Failed to open stream %u in %s\n", stream_index, path);
+		exit(EXIT_FAILURE);
+	}
+
+	struct SwrContext *swr1 = swr_alloc();
+	av_opt_set_int(swr1, "in_channel_count",  codec->channels, 0);
+	av_opt_set_int(swr1, "out_channel_count", 1, 0);
+	av_opt_set_int(swr1, "in_channel_layout",  codec->channel_layout, 0);
+	av_opt_set_int(swr1, "out_channel_layout", AV_CH_LAYOUT_MONO, 0);
+	av_opt_set_int(swr1, "in_sample_rate", codec->sample_rate, 0);
+	av_opt_set_int(swr1, "out_sample_rate", sample_rate, 0);
+	av_opt_set_sample_fmt(swr1, "in_sample_fmt",  codec->format, 0);
+	av_opt_set_sample_fmt(swr1, "out_sample_fmt", AV_SAMPLE_FMT_FLT,  0);
+
+	swr_init(swr1);
+	if (!swr_is_initialized(swr1)) {
+		fprintf(stderr, "Resampler has not been properly initialized\n");
+		exit(EXIT_FAILURE);
+	}
+
+	struct SwrContext *swr2 = swr_alloc();
+	av_opt_set_int(swr2, "in_channel_count",  codec->channels, 0);
+	av_opt_set_int(swr2, "out_channel_count", 2, 0);
+	av_opt_set_int(swr2, "in_channel_layout",  codec->channel_layout, 0);
+	av_opt_set_int(swr2, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+	av_opt_set_int(swr2, "in_sample_rate", codec->sample_rate, 0);
+	av_opt_set_int(swr2, "out_sample_rate", sample_rate, 0);
+	av_opt_set_sample_fmt(swr2, "in_sample_fmt",  codec->format, 0);
+	av_opt_set_sample_fmt(swr2, "out_sample_fmt", AV_SAMPLE_FMT_S16,  0);
+
+	swr_init(swr2);
+	if (!swr_is_initialized(swr2)) {
+		fprintf(stderr, "Resampler has not been properly initialized\n");
+		exit(EXIT_FAILURE);
+	}
+
+	AVPacket packet;
+	av_init_packet(&packet);
+
+	AVFrame *frame = av_frame_alloc();
+	if (!frame) {
+		fprintf(stderr, "Unable to allocate frame\n");
+		exit(EXIT_FAILURE);
+	}
+
+	size_t size = 0;
+
+	int16_t (*playback)[2] = NULL;
+	float *data = NULL;
+
+	uint8_t *buffer1 = NULL;
+	uint8_t *buffer2 = NULL;
+
+	while (av_read_frame(format, &packet) >= 0) {
+		avcodec_send_packet(cntxt, &packet);
+
+		while (avcodec_receive_frame(cntxt, frame) == 0) {
+			if (!buffer1)
+				av_samples_alloc(&buffer1, NULL, 1, frame->nb_samples, AV_SAMPLE_FMT_FLT, 0);
+			if (!buffer2)
+				av_samples_alloc(&buffer2, NULL, 2, frame->nb_samples, AV_SAMPLE_FMT_S16, 0);
+
+			int frame_count = swr_convert(swr1, &buffer1, frame->nb_samples,
+						      (const uint8_t**)frame->data, frame->nb_samples);
+			swr_convert(swr2, &buffer2, frame->nb_samples,
+					      (const uint8_t**)frame->data, frame->nb_samples);
+
+			data = realloc(data, (size + frame_count) * sizeof *data);
+			memcpy(data + size, buffer1, frame_count * sizeof *data);
+
+			playback = realloc(playback, (size + frame_count) * sizeof *playback);
+			memcpy(playback + size, buffer2, frame_count * sizeof *playback);
+
+			size += frame_count;
+
+			av_frame_unref(frame);
+		}
+
+		av_packet_unref(&packet);
+	}
+
+	av_freep(&buffer1);
+	av_freep(&buffer2);
+
+	av_frame_free(&frame);
+
+	swr_free(&swr1);
+	swr_free(&swr2);
+
+	avcodec_close(cntxt);
+	avcodec_free_context(&cntxt);
+
+	avformat_close_input(&format);
+
+	info->sample_rate = sample_rate;
+	info->channels = 2;
+	info->num_samples = size;
+	info->playback = playback;
+	info->data = data;
+}
+
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
 int main(int argc, char *argv[])
@@ -225,20 +344,23 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	struct wave *wav = read_wave(argv[1]);
+	struct audio_info info;
+	// TODO: This works with 44100, but not 48000.
+	// It ends early. This needs to be inverstigated.
+	get_audio_file(argv[1], 44100, &info);
 
 	// I'm going to make these modifiable at runtime at some point,
 	// but until then, they can just be const
 
 	const unsigned frames_per_sec = 60;
-	const size_t frame_offset = wav->fmt.sample_rate / frames_per_sec;
+	const size_t frame_offset = info.sample_rate / frames_per_sec;
 	const size_t audio_offset = frame_offset * 32;
 
-	size_t num_samples = wav->data_hdr.size / wav->fmt.channels / sizeof(int16_t);
+	size_t num_samples = info.num_samples;
 
 	init_window();
 	gl_init();
-	init_alsa(wav);
+	init_alsa(&info);
 
 	struct timespec time_now, time_next;
 	clock_gettime(CLOCK_MONOTONIC, &time_now);
@@ -252,7 +374,7 @@ int main(int argc, char *argv[])
 	complex float *cmplx = NULL;
 	GLfloat *arr = NULL;
 
-	snd_pcm_writei(glob.pcm_handle, &wav->data[0][0], audio_offset);
+	snd_pcm_writei(glob.pcm_handle, info.playback, audio_offset);
 	snd_pcm_pause(glob.pcm_handle, 1);
 
 	glob.fft_recalculate = true;
@@ -281,13 +403,12 @@ int main(int argc, char *argv[])
 
 		float avg = 0.0f;
 		for (size_t j = 0; j < min(glob.fft_size, num_samples - i - 1); ++j) {
-			int16_t mono = (wav->data[i + j][0] + wav->data[i + j][1]) / 2;
-			float sample = (float)mono / INT16_MAX;
-
-			real[j] = sample;
-			avg += sample / glob.fft_size;
+			real[j] = info.data[i + j];
+			avg += real[j] / glob.fft_size;
 		}
 
+		// Zero out data past end of read in samples
+		// i.e. we're at the end of the file
 		for (size_t j = num_samples - i - 1; j < glob.fft_size; ++j)
 			real[j] = 0.0f;
 
@@ -306,7 +427,7 @@ int main(int argc, char *argv[])
 
 			if (frame_start < num_samples) {
 				int ret = snd_pcm_writei(glob.pcm_handle,
-							 &wav->data[frame_start][0],
+							 info.playback + frame_start,
 							 min(audio_offset, num_samples - frame_start));
 				if (ret < 0) {
 					fprintf(stderr, "snd_pcm_writei: %s\n", snd_strerror(ret));
@@ -323,7 +444,7 @@ int main(int argc, char *argv[])
 			clock_gettime(CLOCK_MONOTONIC, &time_now);
 		} while (time_next.tv_sec > time_now.tv_sec && time_next.tv_nsec > time_now.tv_nsec);
 
-		time_next.tv_nsec += (1e9 / wav->fmt.sample_rate) * frame_offset;
+		time_next.tv_nsec += (1e9 / info.sample_rate) * frame_offset;
 		if (time_next.tv_nsec > 1e9) {
 			time_next.tv_nsec -= 1e9;
 			++time_next.tv_sec;
@@ -346,6 +467,8 @@ int main(int argc, char *argv[])
 	fftwf_destroy_plan(plan);
 	fftwf_cleanup();
 
+	free(info.playback);
+	free(info.data);
+
 	free(arr);
-	free(wav);
 }
